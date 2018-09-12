@@ -25,6 +25,7 @@
  * Copyright (c) 2013, Joyent, Inc. All rights reserved.
  * Copyright (c) 2016, Nexenta Systems, Inc. All rights reserved.
  * Copyright (c) 2015 by Chunwei Chen. All rights reserved.
+ * Copyright (c) 2018 Datto Inc.
  */
 
 #include <sys/dmu.h>
@@ -768,6 +769,30 @@ dmu_objset_zfs_unmounting(objset_t *os)
 	return (B_FALSE);
 }
 
+/*
+ * Return the amount of data contained in the given dnode's chunk
+ */
+static uint64_t
+dmu_dnode_count_data_in_chunk(dnode_t *dn, uint64_t offset, uint64_t chunk_len)
+{
+	uint64_t holes_size = 0;
+	uint64_t orig_offset = offset, last_offset = offset;
+
+	while (offset < orig_offset + chunk_len) {
+		if (dnode_next_offset(dn, 0, &offset, 1, 1, 0) != 0)
+			return (chunk_len - holes_size);
+		ASSERT3U(offset, >=, last_offset);
+		if (offset == last_offset) { /* offset is at data */
+			last_offset = ++offset;
+			continue;
+		}
+		holes_size += offset - last_offset;
+		last_offset = ++offset;
+	}
+
+	return (chunk_len - holes_size);
+}
+
 static int
 dmu_free_long_range_impl(objset_t *os, dnode_t *dn, uint64_t offset,
     uint64_t length)
@@ -794,7 +819,7 @@ dmu_free_long_range_impl(objset_t *os, dnode_t *dn, uint64_t offset,
 		length = object_size - offset;
 
 	while (length != 0) {
-		uint64_t chunk_end, chunk_begin, chunk_len;
+		uint64_t chunk_end, chunk_begin, chunk_len, chunk_data_count;
 		uint64_t long_free_dirty_all_txgs = 0;
 		dmu_tx_t *tx;
 
@@ -831,6 +856,9 @@ dmu_free_long_range_impl(objset_t *os, dnode_t *dn, uint64_t offset,
 			continue;
 		}
 
+		chunk_data_count =
+		    dmu_dnode_count_data_in_chunk(dn, chunk_begin, chunk_len);
+
 		tx = dmu_tx_create(os);
 		dmu_tx_hold_free(tx, dn->dn_object, chunk_begin, chunk_len);
 
@@ -847,7 +875,7 @@ dmu_free_long_range_impl(objset_t *os, dnode_t *dn, uint64_t offset,
 
 		mutex_enter(&dp->dp_lock);
 		dp->dp_long_free_dirty_pertxg[dmu_tx_get_txg(tx) & TXG_MASK] +=
-		    chunk_len;
+		    chunk_data_count;
 		mutex_exit(&dp->dp_lock);
 		DTRACE_PROBE3(free__long__range,
 		    uint64_t, long_free_dirty_all_txgs, uint64_t, chunk_len,
